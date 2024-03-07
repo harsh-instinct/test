@@ -1,0 +1,225 @@
+import { useEffect, useState } from "react";
+import { QuestionType } from "@oute/oute-ds.core.constants";
+import { showAlert } from "oute-ds-alert";
+import { shortAndLongTextValidation } from "../validation/short-and-long-text";
+import { yesNoValidation } from "../validation/yes-no";
+import { mcqValidation } from "../validation/mcq";
+import { handlePhoneNumber } from "../questionTypeHandlers/phoneNumber";
+import { phoneNumberValidation } from "../validation/phone-number";
+import { executeTransformedNode } from "../utils/helpers";
+
+const INDEPENDENT_NODE_TYPES = Object.keys(QuestionType);
+
+const useChatRunner = ({ allNodes, taskGraph }) => {
+  const [loading, setLoading] = useState(false);
+  const [answers, setAnswers] = useState({}); // it has answers of all nodes even http and if/else
+  let answerErrorTimeOut;
+  const [executedNodes, setExecutedNodes] = useState([]); // it has ids of all the nodes that are executed
+  const [pipeline, setPipeline] = useState() as any; // it has only question nodes
+
+  const getIndependentNodes = (
+    startNodeId,
+    selectedNodes = [],
+    initNodeType
+  ) => {
+    // if any independent node already added then dont add other type of node
+    // if 1st node is other type then break
+    const question = allNodes[startNodeId];
+    // eslint-disable-next-line no-param-reassign
+    initNodeType = initNodeType ?? question.type; // short text
+    if (INDEPENDENT_NODE_TYPES?.includes(question?.type)) {
+      selectedNodes.push({ qId: question._id, index: selectedNodes?.length });
+      if (question?.config?.settings?.isPhoneValidationEnabled) {
+        return selectedNodes;
+      }
+      if (question.next_node_ids[0]) {
+        getIndependentNodes(
+          question.next_node_ids[0],
+          selectedNodes,
+          initNodeType
+        );
+      }
+    } else {
+      if (INDEPENDENT_NODE_TYPES?.includes(initNodeType)) {
+        return selectedNodes;
+      }
+      selectedNodes.push({ qId: question._id });
+    }
+    return selectedNodes;
+  };
+
+  const initializePipeline = () => {
+    setPipeline([
+      {
+        qId: Object.keys(allNodes)[0],
+        index: 0,
+      },
+    ]);
+    setExecutedNodes([...executedNodes, Object.keys(allNodes)[0]])
+  };
+
+  useEffect(() => {
+    initializePipeline();
+  }, []);
+
+  const executeDependentNode = async ({ nodeId, answersTemp = answers }) => {
+    // eslint-disable-next-line no-async-promise-executor
+    return new Promise(async (resolve) => {
+      const lastVisibleNode = allNodes[nodeId];
+      if (!INDEPENDENT_NODE_TYPES?.includes(lastVisibleNode?.type)) {
+        const nextNodeId = lastVisibleNode?.next_node_ids[0];
+
+        // Checking if all questions are answered
+        if (!nextNodeId) {
+          showAlert({ type: "success", message: "Form completed" });
+        }
+        setLoading(true);
+        const res = await executeTransformedNode({
+          currentNode: lastVisibleNode,
+          type: lastVisibleNode?.type === "HTTP" ? "HTTP" : "IFELSE",
+          answers: answersTemp,
+          allNodes,
+          taskGraph,
+        });
+        setAnswers((ans) => {
+          return { ...ans, [lastVisibleNode?._id]: { answer: res?.result } };
+        });
+        // eslint-disable-next-line no-param-reassign
+        answersTemp = {
+          ...answersTemp,
+          [lastVisibleNode?._id]: { answer: res?.result },
+        };
+        setExecutedNodes([...executedNodes, nextNodeId]);
+        if (!res?.result?._id && !nextNodeId) {
+          setLoading(false);
+          return;
+        }
+
+        const finalNextNodeId = res?.result?._id ?? nextNodeId;
+
+        if (!INDEPENDENT_NODE_TYPES.includes(allNodes[finalNextNodeId]?.type)) {
+          executeDependentNode({ nodeId: finalNextNodeId, answersTemp });
+          return;
+        }
+        setPipeline([
+          ...pipeline,
+          {
+            qId: finalNextNodeId,
+            index: pipeline?.length,
+          },
+        ]);
+        setLoading(false);
+        resolve("");
+      }
+    });
+  };
+
+  useEffect(() => {
+    if (!pipeline) {
+      return;
+    }
+    executeDependentNode({
+      nodeId: pipeline[pipeline?.length - 1]?.qId,
+    });
+  }, [pipeline]);
+
+  const restart = () => {
+    setLoading(false);
+    setAnswers({});
+    initializePipeline();
+  };
+
+  const validateUserAnswer = (node) => {
+    let error = "";
+    clearTimeout(answerErrorTimeOut);
+    const setAnswerError = (_error: string) => {
+      setAnswers((prevAnswer) => ({
+        ...prevAnswer,
+        [node?._id]: {
+          ...prevAnswer[node?._id],
+          error: _error,
+        },
+      }));
+    };
+    if (node?.type === QuestionType.SHORT_TEXT) {
+      error = shortAndLongTextValidation(answers, node);
+    }
+    if (node?.type === QuestionType.LONG_TEXT) {
+      error = shortAndLongTextValidation(answers, node);
+    }
+    if (node?.type === QuestionType.YES_NO) {
+      error = yesNoValidation(answers, node);
+    }
+    if (node?.type === QuestionType.MCQ) {
+      error = mcqValidation(answers, node);
+    }
+    if (node?.type === QuestionType.PHONE_NUMBER) {
+      error = phoneNumberValidation(answers, node);
+    }
+    setAnswerError(error);
+    answerErrorTimeOut = setTimeout(() => {
+      setAnswerError("");
+    }, 5000);
+    return !!error;
+  };
+
+  const executeIndependentNode = async ({ ref }) => {
+    const currentNode = allNodes[pipeline[pipeline?.length - 1]?.qId];
+    const nextNodeId = currentNode?.next_node_ids[0];
+
+    // handling settings validation of questions
+    const isError = validateUserAnswer(currentNode);
+    if (isError) {
+      return;
+    }
+    if (currentNode.type === QuestionType.PHONE_NUMBER) {
+      setLoading(true);
+      const { earlyExit } = await handlePhoneNumber({
+        node: currentNode,
+        ref,
+      });
+      setLoading(false);
+      if (earlyExit) {
+        return;
+      }
+    }
+
+    // Checking if all questions are answered
+    if (!nextNodeId) {
+      showAlert({ type: "success", message: "Form completed" });
+      return;
+    }
+
+    const nextNode = allNodes[nextNodeId];
+    if (!INDEPENDENT_NODE_TYPES?.includes(nextNode?.type)) {
+      /*
+        if nextNode is dependent, call executeDependentNode
+      */
+      await executeDependentNode({ nodeId: nextNodeId });
+      return;
+    }
+    setPipeline((prev) => [
+      ...prev,
+      {
+        qId: nextNodeId,
+        index: pipeline[pipeline?.length - 1]?.index + 1,
+      },
+    ]);
+    setExecutedNodes([...executedNodes, nextNodeId])
+  };
+
+  return {
+    allNodes,
+    loading,
+    pipeline,
+    answers,
+    setAnswers,
+    setLoading,
+    getIndependentNodes,
+    setPipeline,
+    executeIndependentNode,
+    restart,
+  };
+};
+
+export default useChatRunner;
